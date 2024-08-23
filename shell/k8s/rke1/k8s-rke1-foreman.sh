@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
+
 # A script that
 # (1) updates all packages on a RHEL-like Linux,
-# (2) reboots conditionally
-# (3) if no reboot is required, checks whether essential kubepods*.slice files got created; these files are usually purged after a dnf docker upgrade
-#     if the files don't exist, kubelet gets restarted twice which should create them w/o any service impact
+# (2) reboots conditionally if `needs-restarting` tells us so
+# (3) if no reboot is required, checks whether certain packages [0] have been upgraded; if so, we reboot too
 #
-# for further details see https://github.com/world-direct/technology/issues/138
+# for further details see ~~https://github.com/world-direct/technology/issues/138~~ the more recent https://github.com/world-direct/foreman-helpers/issues/1
+#
+#
+# ------
 #
 # In Foreman, create a `Job Template` w/ the following content to use it
 #
@@ -18,6 +21,42 @@
 #    ```shell
 #    [ "$(date '+%u')" = "4" ] && curl --silent https://raw.githubusercontent.com/world-direct/foreman-helpers/main/shell/k8s/rke1/k8s-rke1-foreman.sh | bash
 #    ```
+#
+# ------
+#
+# A typical output of `dnf history info last`, when docker-related packages were upgraded, looks as follows:
+#
+# $ dnf history info last
+# Not root, Subscription Management repositories not updated
+# Transaction ID : 24
+# Begin time     : Thu 22 Aug 2024 11:30:19 PM CEST
+# Begin rpmdb    : 01b08e3ca5704da392c8316abf4978f0b2c0e3ae4166b8fe74f6fb78e5cf3bcf
+# End time       : Thu 22 Aug 2024 11:30:34 PM CEST (15 seconds)
+# End rpmdb      : a8b6ede1850ad921a37fed578f1021e23f062644bdbb8035c171c862e4f6f682
+# User           : Foreman Remote Execution <foremanremexec>
+# Return-Code    : Success
+# Releasever     : 9
+# Command Line   : update -y
+# Comment        :
+# Packages Altered:
+#     Upgrade  containerd.io-1.7.20-3.1.el9.x86_64           @docker-ce-stable
+#     Upgraded containerd.io-1.7.19-3.1.el9.x86_64           @@System
+#     Upgrade  docker-buildx-plugin-0.16.2-1.el9.x86_64      @docker-ce-stable
+#     Upgraded docker-buildx-plugin-0.16.1-1.el9.x86_64      @@System
+#     Upgrade  docker-ce-3:27.1.2-1.el9.x86_64               @docker-ce-stable
+#     Upgraded docker-ce-3:27.1.1-1.el9.x86_64               @@System
+#     Upgrade  docker-ce-cli-1:27.1.2-1.el9.x86_64           @docker-ce-stable
+#     Upgraded docker-ce-cli-1:27.1.1-1.el9.x86_64           @@System
+#     Upgrade  docker-ce-rootless-extras-27.1.2-1.el9.x86_64 @docker-ce-stable
+#     Upgraded docker-ce-rootless-extras-27.1.1-1.el9.x86_64 @@System
+
+# [0]
+# the package name needs to <<start with>> any of the following names, e.g. `containerd` matches `containerd.io-1.7.20-3.1.el9.x86_64` etc.
+PACKAGE_PREFIXES_TO_CHECK=(
+  "containerd.io"
+  "docker-ce" # includes `docker-ce-cli` and `docker-ce-rootless-extras`
+  "docker-buildx-plugin"
+)
 
 set -o errexit
 set -o nounset
@@ -27,93 +66,67 @@ if [[ "${TRACE-0}" == "1" ]]; then
   set -o xtrace
 fi
 
-# these files are created dynamically by `kubelet` upon start and are essential for scheduling on the current node:
-# w/o them no pod of the coresponding QoS class will be able to run, showing an error in the events instead
-# for unknown reasons though it usually takes two kubelet restarts for these files to be created
-FILES_TO_CHECK=(
-  "/run/systemd/transient/kubepods.slice"            # Guaranteed QoS
-  "/run/systemd/transient/kubepods-burstable.slice"  # Burstable QoS, depends on `kubepods.slice`
-  "/run/systemd/transient/kubepods-besteffort.slice" # Best effort QoS, depends on `kubepods.slice`
-)
-
-MAX_RETRIES=2
-
-# delay in seconds between successive kubelet restarts
-DELAY=60
-
-check_files() {
-  for file in "${FILES_TO_CHECK[@]}"; do
-    if [[ ! -f "$file" ]]; then
-      echo "File $file does not exist"
-      return 1
-    fi
-  done
-  return 0
-}
-
-restart_kubelet_action() {
-  echo "Executing docker restart kubelet"
-  docker restart kubelet
-}
-
 update_action() {
-  echo "Executing dnf update -y"
+  printf "Executing dnf update -y\n"
   dnf update -y
 }
 
 reboot_action() {
-  echo "Executing shutdown -t 1"
+  printf "Executing shutdown -t 1\n"
   shutdown -t 1
 }
 
-check_reboot() {
+check_kernel_reboot_required() {
   if needs-restarting -r | grep --quiet "Reboot should not be necessary."; then
-    echo "No reboot required, return 0"
-    return 0
-  else
-    echo "Reboot required, return 1"
+    printf "No reboot required, return 1\n"
     return 1
+  else
+    printf "Reboot required, return 0\n"
+    return 0
   fi
 }
 
-kubelet_restart_loop() {
-  for ((i=0; i<MAX_RETRIES; i++)); do
-    if check_files; then
-      echo "All required files exist, not restarting kubelet"
+essential_package_updated() {
+  LAST_TRANSACTION=$(dnf history info last)
+  printf "Checking last dnf transaction which reads:\n\n---\n\n$LAST_TRANSACTION\n\n---\n\n"
+
+  LAST_TRANSACTION_BEGIN_TIME=$(echo "$LAST_TRANSACTION" | grep "Begin time") # Begin time     : Thu 22 Aug 2024 11:30:19 PM CEST
+  TODAY=$(date '+%a %d %b %Y') # Fri 23 Aug 2024
+  if echo $LAST_TRANSACTION_BEGIN_TIME | grep --quiet "$TODAY"; then
+    printf "Latest upgrade transaction took place today (i.e., was instrumented by this script run) -> continuing to check wheter packages requiring a reboot got upgraded\n"
+  else
+    printf "INFO: Latest upgrade action did NOT happen today (=\"$TODAY\"), but on \"$LAST_TRANSACTION_BEGIN_TIME\" instead -> NOT continuing to check whether any packages got an update since this happened in a previous run of this script already; return 1\n"
+    return 1
+  fi
+
+  UPGRADED_PACKAGES=$(echo "$LAST_TRANSACTION" | grep -E "Upgrade[[:space:]]+")
+  printf "Checking whether essential packages requiring a reboot got upgraded; upgraded packages are:\n\n---\n\n$UPGRADED_PACKAGES\n\n---\n\n"
+
+  for PACKAGE_PREFIX in "${PACKAGE_PREFIXES_TO_CHECK[@]}"; do
+    if echo "$UPGRADED_PACKAGES" | grep --quiet "$PACKAGE_PREFIX"; then
+      printf "Essential package with prefix \"$PACKAGE_PREFIX\" was updated -> reboot required; return 0\n"
       return 0
     fi
-
-    echo "One or more files do not exist -> restarting kubelet"
-    restart_kubelet_action
-
-    echo "Sleeping for $DELAY seconds to give kubelet time to boot up properly and create the required files which usually happens after the 2nd kubelet restart, cf. https://github.com/world-direct/technology/issues/138"
-    sleep $DELAY
   done
 
-  if ! check_files; then
-    echo "ERROR: Files still do not exist after $MAX_RETRIES kubelet restarts"
-    return 1
-  else
-    return 0
-  fi
+  printf "No essential package requiring a reboot got upgraded; return 1\n"
+  return 1
 }
 
 main() {
   update_action
-  if ! check_reboot; then
+  if check_kernel_reboot_required; then
     reboot_action
   else
-    # TODO: we could check whether docker/containerd got an update which is usually when the error occurs
-    # we could, e.g. use `dnf history info last | grep -i docker` here
-    # however, simply checking always does not really hurt
-    if ! kubelet_restart_loop; then
-      echo "ERROR: kubelet restart did not help restoring files, manual intervention required, exit 1"
-      exit 1
+    if essential_package_updated; then
+      printf "Essential package(s) HAVE been updated -> rebooting now\n"
+      reboot_action
     else
-      echo "INFO: OK, all required files exist, return 0"
-      return 0
+      printf "No essential package(s) have been updated, nothing to do\n"
     fi
   fi
+
+  exit 0
 }
 
 main "$@"
