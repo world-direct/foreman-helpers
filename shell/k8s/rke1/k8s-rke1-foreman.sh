@@ -67,13 +67,13 @@ if [[ "${TRACE-0}" == "1" ]]; then
 fi
 
 update_action() {
-  printf "Executing dnf update -y\n"
+  printf "Executing \"dnf update -y\"\n"
   dnf update -y
 }
 
 reboot_action() {
-  printf "Executing shutdown -t 1\n"
-  shutdown -t 1
+  printf "Executing \"shutdown -t 1 -r\"\n"
+  shutdown -t 1 -r
 }
 
 check_kernel_reboot_required() {
