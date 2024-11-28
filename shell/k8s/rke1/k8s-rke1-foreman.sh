@@ -72,8 +72,8 @@ update_action() {
 }
 
 reboot_action() {
-  printf "Executing \"shutdown -t 1 -r\"\n"
-  shutdown -t 1 -r
+  printf "Signal restart for kured by touch /var/run/reboot-required"
+  touch /var/run/reboot-required
 }
 
 check_kernel_reboot_required() {
