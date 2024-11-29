@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 
-# A script that
+# A script that is hand-crafted for Foreman updates on **RKE1** K8s nodes which:
 # (1) updates all packages on a RHEL-like Linux,
-# (2) reboots conditionally if `needs-restarting` tells us so
-# (3) if no reboot is required, checks whether certain packages [0] have been upgraded; if so, we reboot too
+# (2) reboots[^1] conditionally if `needs-restarting` tells us so
+# (3) if no reboot is required, checks whether certain packages [0] have been upgraded; if so, we reboot[^1], too
 #
-# for further details see ~~https://github.com/world-direct/technology/issues/138~~ the more recent https://github.com/world-direct/foreman-helpers/issues/1
+# [^1]: originally, we rebooted directly (`shutdown -t 1 -r`); however, since we are hosting more and more stateful services on K8s, we
+#       introduced [kured](https://github.com/world-direct/k8s-gitops-clusters/blob/main/docs/kured/kured.md) and
+#       only raise a signal towards `kured`, which does the actual coordinated reboot
 #
+# For further details and motivation see
+# https://github.com/world-direct/foreman-helpers/issues/1 which superseded
+# ~~https://github.com/world-direct/technology/issues/138~~
 #
 # ------
 #
@@ -16,7 +21,7 @@
 #    curl --silent https://raw.githubusercontent.com/world-direct/foreman-helpers/main/shell/k8s/rke1/k8s-rke1-foreman.sh | bash
 #    ```
 #
-# Of course, you can compine it arbitrarily, e.g. for running only on Thursday (handy for running every 2nd Thursday, a thing one can't express using solely Cron expressions, but working around it using `00 23 8-14,22-31 * *`) simply use:
+# Of course, you can combine it arbitrarily, e.g. for running only on Thursday (handy for running every 2nd Thursday, a thing one can't express using solely Cron expressions, but working around it using `00 23 8-14,22-31 * *`) simply use:
 #
 #    ```shell
 #    [ "$(date '+%u')" = "4" ] && curl --silent https://raw.githubusercontent.com/world-direct/foreman-helpers/main/shell/k8s/rke1/k8s-rke1-foreman.sh | bash
@@ -24,7 +29,7 @@
 #
 # ------
 #
-# A typical output of `dnf history info last`, when docker-related packages were upgraded, looks as follows:
+# A typical output of `dnf history info last` when docker-related packages *were* upgraded looks as follows:
 #
 # $ dnf history info last
 # Not root, Subscription Management repositories not updated
@@ -72,12 +77,13 @@ update_action() {
 }
 
 reboot_action() {
-  printf "Signal restart for kured by touch /var/run/reboot-required"
-  touch /var/run/reboot-required
+  printf "Touching /run/reboot-required, thus signalling kured to initiate coordinated reboot actions"
+  printf "See https://github.com/world-direct/k8s-gitops-clusters/blob/main/docs/kured/kured.md for details and troubleshooting"
+  touch /run/reboot-required
 }
 
 check_kernel_reboot_required() {
-  if needs-restarting -r | grep --quiet "Reboot should not be necessary."; then
+  if needs-restarting --reboothint; then
     printf "No reboot required, return 1\n"
     return 1
   else
@@ -119,7 +125,7 @@ main() {
     reboot_action
   else
     if essential_package_updated; then
-      printf "Essential package(s) HAVE been updated -> rebooting now\n"
+      printf "Essential package(s) HAVE been updated -> invoking reboot_action\n"
       reboot_action
     else
       printf "No essential package(s) have been updated, nothing to do\n"
